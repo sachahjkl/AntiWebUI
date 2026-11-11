@@ -70,6 +70,17 @@ struct Runtime {
     flushing: bool,
 }
 
+/// The runtime goes when its thread ends, after the windows and roots of the thread disposed of
+/// what they owned. The nodes left are dropped with a panic contained: their values and cleanups
+/// may reach thread-locals that are gone by then, or a connection that failed, and a panic out of
+/// the destructor of a thread-local aborts the program.
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        let nodes = std::mem::take(&mut self.nodes);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(nodes)));
+    }
+}
+
 thread_local! {
     static RUNTIME: RefCell<Runtime> = RefCell::new(Runtime::default());
     static UNTRACK: Cell<bool> = const { Cell::new(false) };

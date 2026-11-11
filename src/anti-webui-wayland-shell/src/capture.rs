@@ -253,17 +253,24 @@ fn start(target: CaptureTarget, mut job: Arc<Job>) -> Result<Arc<Job>, Arc<Job>>
     if g.shm.is_none() {
         return Err(job);
     }
+    // A window that closed, or an output that went, leaves a dead object, and a request made
+    // with one gives an inert object. Neither may be the argument of a request: wayland-backend
+    // panics then, with its lock held, and every later request of the connection panics too.
     let ext = |make: &dyn Fn() -> Option<source::ExtImageCaptureSourceV1>| {
-        g.ext.as_ref().and_then(|_| make()).map(Way::Ext)
+        g.ext
+            .as_ref()
+            .and_then(|_| make())
+            .filter(|source| source.is_alive())
+            .map(Way::Ext)
     };
     let by_ext = || match &target {
         CaptureTarget::Toplevel(t) => ext(&|| {
             let (m, h) = (g.toplevel_sources.as_ref()?, t.ext_handle()?);
-            Some(m.create_source(h, &link.qh, ()))
+            h.is_alive().then(|| m.create_source(h, &link.qh, ()))
         }),
         CaptureTarget::Output(o) => ext(&|| {
             let (m, out) = (g.output_sources.as_ref()?, output_object(&o.name)?);
-            Some(m.create_source(&out, &link.qh, ()))
+            out.is_alive().then(|| m.create_source(&out, &link.qh, ()))
         }),
         CaptureTarget::HyprlandAddress(_) => None,
     };
@@ -271,7 +278,7 @@ fn start(target: CaptureTarget, mut job: Arc<Job>) -> Result<Arc<Job>, Arc<Job>>
         g.hyprland.as_ref()?;
         match &target {
             CaptureTarget::Toplevel(t) => {
-                let h = t.wlr_handle()?;
+                let h = t.wlr_handle().filter(|h| h.is_alive())?;
                 (g.hyprland.as_ref()?.version() >= 2).then(|| Way::HyprlandWlr(h.clone()))
             }
             CaptureTarget::HyprlandAddress(a) => Some(Way::HyprlandAddress(*a as u32)),
@@ -400,11 +407,13 @@ impl ShmBuffer {
             (),
         );
         pool.destroy();
-        Some(Self {
+        let made = Self {
             buffer,
             map,
             layout,
-        })
+        };
+        // An inert buffer may not be the argument of `attach_buffer` or `copy` (see `start`).
+        made.buffer.is_alive().then_some(made)
     }
 
     fn bytes(&self) -> &[u8] {
