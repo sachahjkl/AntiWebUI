@@ -392,12 +392,22 @@ net.scan() -> Task<..>
 net.connect(&ap, password: Option<String>) -> Task<Result<(), NetError>>
 net.disconnect() -> Task<..>
 net.wired() -> Option<Wired>
+net.devices() -> Vec<NetworkDevice>     // interface, kind, state, speed, IPv4/IPv6 のアドレス、ゲートウェイ、DNS
+net.set_device_enabled(&device, bool) -> Task<..>
+net.connections() -> Vec<SavedConnection> // 保存済みの接続：name, kind, ssid, autoconnect, state
+net.activate(&c) -> Task<Result<(), NetError>>; net.deactivate(&c); net.forget(&c)
+net.set_autoconnect(&c, bool) -> Task<..>
+net.settings(&c) -> Task<Result<ConnectionSettings, _>>  // 名前、自動接続、鍵、IPv4/IPv6 の方式とアドレス
+net.save_settings(&c, ConnectionSettings) -> Task<..>
+net.join_hidden(ssid, security, password) -> Task<Result<(), NetError>>
 ```
 
 - **接続の仕方：** `connect` は、保存済みの接続があれば `ActivateConnection`、なければ `AddAndActivateConnection` で行う。
 - **パスワード：**
   - 保存済みの接続でパスワードが足りないときの入力（シークレットエージェント）は、あとで足す。
   - それまでは `NetError::NeedsSecret` を返す。
+- **設定の書き換え：** `save_settings` は `GetSettings` で全部を読み、よく使う項目だけを変えて、`Update2`（フラグ 0：保存先はそのまま）で書き戻す。ほかの設定は残る。秘密（鍵）を含めなければ、保存済みの鍵はそのまま残る。保存済みの鍵は読めない（`key` は常に `None`）。新しい鍵は NetworkManager 自身が保存する（`psk-flags` 0）。
+- **アドレス：** `address-data` と文字の `gateway` で書く。DNS は 2 進の `dns` と、NetworkManager が持っていれば `dns-data`（1.48 から）の両方に書く。おかしなアドレスは、送る前に `ServiceError::Failed` で断る。
 - **iwd：** iwd を直接使う版はあとで足す。NetworkManager が iwd を下で使っている構成でも、NetworkManager 経由で動く。
 
 ### 通知、トレイ、メディア
@@ -694,7 +704,7 @@ src/anti-webui-wayland-shell/
 - **L3 もできた。**
   - 共通：`dbus.rs`（zbus。2 本のバスを隠れたスレッド 1 本で回す、`while_owned` で相手が後から起きても埋まる）と、UI スレッドへイベントを渡す `listeners.rs`。
   - 機能（どれも feature。facade では `shell-<名前>`、全部は `shell-all`）：
-    - `network()`：接続状態、Wi-Fi のオンオフ、AP の一覧（SSID ごとに一番強いもの、強い順）、スキャン、接続、切断、有線。保存済みでない鍵つきの AP をパスワードなしでつなぐと `NetError::NeedsSecret`。保存済みでない Enterprise は `Unsupported`。
+    - `network()`：接続状態、Wi-Fi のオンオフ、AP の一覧（SSID ごとに一番強いもの、強い順）、スキャン、接続、切断、有線、機器とそのアドレス、保存済みの接続（接続、切断、削除、自動接続、設定の読み書き）、隠しネットワーク。保存済みでない鍵つきの AP をパスワードなしでつなぐと `NetError::NeedsSecret`。保存済みでない Enterprise は `Unsupported`。
     - `battery()`：表示用のまとめた電池、`devices()` でマウスなどの電池も。残り時間、電力、エネルギー、劣化具合（`health()`）、充電回数（`charge_cycles()`）も読める。後の 2 つは、表示用の電池にはないので、パソコン自身の電池から取る。
     - `power_profiles()`：新旧どちらの名前の power-profiles-daemon にも対応。
     - `bluetooth()`：アダプタと機器、電源、探索、接続、ペアリング、信頼、削除、機器の電池。
