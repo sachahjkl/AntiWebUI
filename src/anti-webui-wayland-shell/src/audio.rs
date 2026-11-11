@@ -2,8 +2,8 @@
 //! is first used, as FFmpeg is for video; without it there is nothing here. See "音声" in
 //! `docs/design/37-wayland-shell.md`.
 //!
-//! PipeWire runs a thread of its own, which tells of nodes, links and the default devices; what
-//! comes in goes to signals there. Changing something takes that thread's lock for a moment.
+//! PipeWire runs a thread of its own, which tells of nodes, links, cards and the default devices;
+//! what comes in goes to signals there. Changing something takes that thread's lock for a moment.
 
 mod ffi;
 mod pod;
@@ -12,11 +12,12 @@ use crate::ServiceError;
 use anti_webui_core::shared::{SharedSignal, shared_signal};
 use anti_webui_core::task::Task;
 use ffi::{
-    CoreEvents, CoreMethods, Lib, MetadataEvents, MetadataMethods, NodeEvents, NodeInfo,
-    NodeMethods, Object, RegistryEvents, RegistryMethods, SpaDict, SpaHook, SpaPod, methods,
+    CoreEvents, CoreMethods, DeviceEvents, DeviceInfo, DeviceMethods, Lib, MetadataEvents,
+    MetadataMethods, NodeEvents, NodeInfo, NodeMethods, Object, RegistryEvents, RegistryMethods,
+    SpaDict, SpaHook, SpaPod, methods,
 };
-use std::collections::HashMap;
-use std::ffi::{CString, c_char, c_int, c_void};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::sync::OnceLock;
 
 /// A device sound goes to or comes from, like speakers or a microphone, as it was when read.
@@ -29,10 +30,66 @@ pub struct AudioDevice {
     /// What to show, like `Built-in Audio Analog Stereo`.
     pub description: String,
     /// On the scale volume controls show, as WirePlumber's: 1 is as loud as it goes without
-    /// amplifying, and it can go above.
+    /// amplifying, and it can go above. The loudest channel's.
     pub volume: f64,
     pub muted: bool,
     pub channels: u32,
+    /// The volume of each channel, on the scale of `volume`.
+    pub volumes: Vec<f64>,
+    /// Where each channel goes, like `FL` and `FR`, in the order of `volumes`, when known.
+    pub positions: Vec<String>,
+    /// The card it is on (an [`AudioCard::id`]), when it is on one.
+    pub card: Option<u32>,
+    /// The ports of its card it can use, like headphones and speakers, in the card's profile.
+    pub ports: Vec<AudioPort>,
+    /// The [`AudioPort::index`] of the port in use.
+    pub port: Option<u32>,
+}
+
+/// A port of a card's device, like headphones, speakers or HDMI, as it was when read.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioPort {
+    /// Its index among the card's ports.
+    pub index: u32,
+    /// What the card calls it by, like `analog-output-headphones`.
+    pub name: String,
+    /// What to show, like `Headphones`.
+    pub description: String,
+    /// Something is plugged into it (`Some(true)`), nothing is (`Some(false)`), or the card
+    /// can't tell.
+    pub available: Option<bool>,
+    pub priority: i32,
+}
+
+/// A sound card, as it was when read: what it is set up to do (its profile).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioCard {
+    /// PipeWire's id, the same while it is there.
+    pub id: u32,
+    /// What PipeWire calls it by, like `alsa_card.pci-0000_00_1f.3`.
+    pub name: String,
+    /// What to show, like `Built-in Audio`.
+    pub description: String,
+    /// The name of an icon in the icon theme, when the card says.
+    pub icon_name: String,
+    /// What it can be set up to do, in the card's order.
+    pub profiles: Vec<AudioProfile>,
+    /// The [`AudioProfile::index`] of the profile in use.
+    pub profile: Option<u32>,
+}
+
+/// A way a card can be set up, like `Analog Stereo Duplex`, `Digital Stereo (HDMI)` or `Off`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioProfile {
+    pub index: u32,
+    /// What the card calls it by, like `output:analog-stereo+input:analog-stereo`.
+    pub name: String,
+    /// What to show.
+    pub description: String,
+    /// It can be used now (`Some(true)`), it can't (`Some(false)`: nothing plugged in), or the
+    /// card can't tell.
+    pub available: Option<bool>,
+    pub priority: i32,
 }
 
 /// The sound of a program, playing or recording, as it was when read.
@@ -69,6 +126,7 @@ struct Shared {
     sinks: SharedSignal<Vec<AudioDevice>>,
     sources: SharedSignal<Vec<AudioDevice>>,
     streams: SharedSignal<Vec<AudioStream>>,
+    cards: SharedSignal<Vec<AudioCard>>,
     default_sink: SharedSignal<Option<String>>,
     default_source: SharedSignal<Option<String>>,
 }
@@ -84,6 +142,7 @@ pub fn audio() -> Audio {
         sinks: shared_signal(Vec::new()),
         sources: shared_signal(Vec::new()),
         streams: shared_signal(Vec::new()),
+        cards: shared_signal(Vec::new()),
         default_sink: shared_signal(None),
         default_source: shared_signal(None),
     });
@@ -128,6 +187,11 @@ impl Audio {
         self.0.streams.get()
     }
 
+    /// The sound cards, with their profiles.
+    pub fn cards(&self) -> Vec<AudioCard> {
+        self.0.cards.get()
+    }
+
     /// Makes a device the default one, for sound going to it or coming from it, as it is.
     pub fn set_default(&self, device: &AudioDevice) -> Task<Result<(), ServiceError>> {
         let source = self.sources().iter().any(|d| d.id == device.id);
@@ -137,29 +201,138 @@ impl Audio {
             "default.configured.audio.sink"
         };
         let value = format!("{{\"name\":{}}}", json_string(&device.name));
-        Task::ready(with_pw(|pw| pw.set_default(key, &value)))
+        Task::ready(with_pw(|pw| {
+            pw.set_metadata(0, key, Some(c"Spa:String:JSON"), Some(value.as_str()))
+        }))
     }
 }
 
 impl AudioDevice {
-    /// Sets the volume of every channel, on the scale of [`AudioDevice::volume`].
+    /// Sets the volume, on the scale of [`AudioDevice::volume`]: the loudest channel gets it, and
+    /// the others keep their share of it, so the balance stays.
     pub fn set_volume(&self, volume: f64) -> Task<Result<(), ServiceError>> {
         Task::ready(with_pw(|pw| pw.set_volume(self.id, volume)))
     }
 
+    /// Sets the volume of each channel, in the order of [`AudioDevice::volumes`].
+    pub fn set_volumes(&self, volumes: &[f64]) -> Task<Result<(), ServiceError>> {
+        Task::ready(with_pw(|pw| pw.set_volumes(self.id, volumes)))
+    }
+
     pub fn set_muted(&self, muted: bool) -> Task<Result<(), ServiceError>> {
         Task::ready(with_pw(|pw| pw.set_muted(self.id, muted)))
+    }
+
+    /// Between the left channels and the right ones: -1 is all left, 0 even, 1 all right. 0 when
+    /// it has no channel on one side.
+    pub fn balance(&self) -> f64 {
+        balance_of(&self.volumes, &self.positions)
+    }
+
+    /// Sets the balance, as [`AudioDevice::balance`] reads it, at the same volume.
+    pub fn set_balance(&self, balance: f64) -> Task<Result<(), ServiceError>> {
+        self.set_volumes(&with_balance(&self.volumes, &self.positions, balance))
+    }
+
+    /// Uses the port [`AudioPort::index`] of its card, like headphones rather than speakers.
+    pub fn set_port(&self, index: u32) -> Task<Result<(), ServiceError>> {
+        Task::ready(with_pw(|pw| pw.set_port(self.id, index)))
     }
 }
 
 impl AudioStream {
-    /// Sets the volume of every channel, on the scale of [`AudioDevice::volume`].
+    /// Sets the volume, as [`AudioDevice::set_volume`] does.
     pub fn set_volume(&self, volume: f64) -> Task<Result<(), ServiceError>> {
         Task::ready(with_pw(|pw| pw.set_volume(self.id, volume)))
     }
 
     pub fn set_muted(&self, muted: bool) -> Task<Result<(), ServiceError>> {
         Task::ready(with_pw(|pw| pw.set_muted(self.id, muted)))
+    }
+
+    /// Sends it to `device`, or takes it from there when it records: WirePlumber links it again,
+    /// and remembers the choice for the program.
+    pub fn move_to(&self, device: &AudioDevice) -> Task<Result<(), ServiceError>> {
+        Task::ready(with_pw(|pw| pw.move_stream(self.id, device.id)))
+    }
+}
+
+impl AudioCard {
+    /// Sets the card up as its profile [`AudioProfile::index`] says.
+    pub fn set_profile(&self, index: u32) -> Task<Result<(), ServiceError>> {
+        Task::ready(with_pw(|pw| pw.set_profile(self.id, index)))
+    }
+}
+
+/// Which side a channel position is on: `Some(false)` left, `Some(true)` right.
+fn side(position: &str) -> Option<bool> {
+    const LEFT: [&str; 13] = [
+        "FL", "SL", "FLC", "RL", "TFL", "TRL", "RLC", "FLW", "FLH", "TFLC", "TSL", "LLFE", "BLC",
+    ];
+    const RIGHT: [&str; 13] = [
+        "FR", "SR", "FRC", "RR", "TFR", "TRR", "RRC", "FRW", "FRH", "TFRC", "TSR", "RLFE", "BRC",
+    ];
+    if LEFT.contains(&position) {
+        Some(false)
+    } else if RIGHT.contains(&position) {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// The balance of volumes, as PulseAudio reckons it: the quieter side's share of the louder.
+fn balance_of(volumes: &[f64], positions: &[String]) -> f64 {
+    let (mut left, mut right) = (0.0f64, 0.0f64);
+    let (mut lefts, mut rights) = (0u32, 0u32);
+    for (&v, p) in volumes.iter().zip(positions) {
+        match side(p) {
+            Some(false) => (left, lefts) = (left + v, lefts + 1),
+            Some(true) => (right, rights) = (right + v, rights + 1),
+            None => {}
+        }
+    }
+    if lefts == 0 || rights == 0 {
+        return 0.0;
+    }
+    let (left, right) = (left / lefts as f64, right / rights as f64);
+    if left == right {
+        0.0
+    } else if left > right {
+        right / left - 1.0
+    } else {
+        1.0 - left / right
+    }
+}
+
+/// `volumes` with the balance given, at the loudest of them.
+fn with_balance(volumes: &[f64], positions: &[String], balance: f64) -> Vec<f64> {
+    let balance = balance.clamp(-1.0, 1.0);
+    let loudest = volumes.iter().copied().fold(0.0, f64::max);
+    volumes
+        .iter()
+        .enumerate()
+        .map(|(i, _)| match positions.get(i).and_then(|p| side(p)) {
+            Some(false) if balance > 0.0 => loudest * (1.0 - balance),
+            Some(true) if balance < 0.0 => loudest * (1.0 + balance),
+            _ => loudest,
+        })
+        .collect()
+}
+
+/// Positions as PipeWire's `audio.position` lists them, like `FL,FR` or `[ FL FR ]`.
+fn positions_in(list: &str) -> Vec<String> {
+    list.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn availability(value: u32) -> Option<bool> {
+    match value {
+        pod::AVAILABLE_YES => Some(true),
+        pod::AVAILABLE_NO => Some(false),
+        _ => None,
     }
 }
 
@@ -250,6 +423,29 @@ struct Node {
     props: HashMap<String, String>,
     volumes: Vec<f32>,
     muted: bool,
+    /// Where each channel goes, from its `Props`.
+    positions: Vec<String>,
+    state: *mut State,
+}
+
+/// A card bound to hear of its profiles and ports. Boxed, as a [`Node`].
+struct Card {
+    id: u32,
+    proxy: *mut Object,
+    hook: Box<SpaHook>,
+    props: HashMap<String, String>,
+    /// Its profiles and its routes (ports), by index.
+    profiles: BTreeMap<u32, pod::Profile>,
+    routes: BTreeMap<u32, pod::Route>,
+    /// The profile in use, and the route in use by each of its devices.
+    profile: Option<u32>,
+    active: BTreeMap<i32, u32>,
+    /// The flags each param had when last told, to ask again only for those that changed.
+    param_flags: HashMap<u32, u32>,
+    /// The params asked for again: the first answer replaces what was known.
+    asked: HashSet<u32>,
+    /// The number of the last request, which PipeWire gives back with the answers.
+    seq: c_int,
     state: *mut State,
 }
 
@@ -264,6 +460,7 @@ struct State {
     lib: &'static Lib,
     registry: *mut Object,
     nodes: HashMap<u32, Box<Node>>,
+    cards: HashMap<u32, Box<Card>>,
     /// Links by id: the node sound comes out of and the one it goes into.
     links: HashMap<u32, (u32, u32)>,
     metadata: Option<Metadata>,
@@ -318,6 +515,12 @@ static NODE_EVENTS: NodeEvents = NodeEvents {
     param: Some(node_param),
 };
 
+static DEVICE_EVENTS: DeviceEvents = DeviceEvents {
+    version: 0,
+    info: Some(card_info),
+    param: Some(card_param),
+};
+
 static METADATA_EVENTS: MetadataEvents = MetadataEvents {
     version: 0,
     property: Some(metadata_property),
@@ -353,6 +556,7 @@ impl Pw {
                 lib,
                 registry,
                 nodes: HashMap::new(),
+                cards: HashMap::new(),
                 links: HashMap::new(),
                 metadata: None,
                 default_sink: None,
@@ -401,33 +605,138 @@ impl State {
         unsafe { &*self.shared }
     }
 
-    fn set_volume(&mut self, id: u32, volume: f64) -> Result<(), ServiceError> {
-        let node = self
-            .nodes
+    fn node(&self, id: u32) -> Result<&Node, ServiceError> {
+        self.nodes
             .get(&id)
-            .ok_or(ServiceError::Failed("no such node".into()))?;
-        let linear = volume.max(0.0).powi(3) as f32;
-        let volumes = vec![linear; node.volumes.len().max(1)];
-        set_props(node.proxy, &pod::build_props(Some(&volumes), None))
+            .map(|n| &**n)
+            .ok_or(ServiceError::Failed("no such node".into()))
+    }
+
+    fn set_volume(&mut self, id: u32, volume: f64) -> Result<(), ServiceError> {
+        let node = self.node(id)?;
+        let now: Vec<f64> = node.volumes.iter().map(|&v| cubic(v)).collect();
+        let loudest = now.iter().copied().fold(0.0, f64::max);
+        let volume = volume.max(0.0);
+        let volumes: Vec<f64> = if loudest > 1e-4 {
+            now.iter().map(|v| v * volume / loudest).collect()
+        } else {
+            vec![volume; now.len().max(1)]
+        };
+        self.set_volumes(id, &volumes)
+    }
+
+    fn set_volumes(&mut self, id: u32, volumes: &[f64]) -> Result<(), ServiceError> {
+        let node = self.node(id)?;
+        if volumes.is_empty() {
+            return Ok(());
+        }
+        let linear: Vec<f32> = volumes.iter().map(|v| v.max(0.0).powi(3) as f32).collect();
+        set_props(node.proxy, &pod::build_props(Some(&linear), None))
     }
 
     fn set_muted(&mut self, id: u32, muted: bool) -> Result<(), ServiceError> {
-        let node = self
-            .nodes
-            .get(&id)
-            .ok_or(ServiceError::Failed("no such node".into()))?;
+        let node = self.node(id)?;
         set_props(node.proxy, &pod::build_props(None, Some(muted)))
     }
 
-    fn set_default(&mut self, key: &str, value: &str) -> Result<(), ServiceError> {
+    /// Sets `key` of `subject` in the `default` metadata, or takes it away when `value` is None.
+    fn set_metadata(
+        &mut self,
+        subject: u32,
+        key: &str,
+        kind: Option<&CStr>,
+        value: Option<&str>,
+    ) -> Result<(), ServiceError> {
         let meta = self.metadata.as_ref().ok_or(ServiceError::Unsupported)?;
-        let (key, kind, value) = (cstring(key)?, c"Spa:String:JSON", cstring(value)?);
+        let key = cstring(key)?;
+        let value = value.map(cstring).transpose()?;
         // SAFETY: a live metadata proxy, used under PipeWire's lock.
         let res = unsafe {
             let (m, data) = methods::<MetadataMethods>(meta.proxy);
-            (m.set_property)(data, 0, key.as_ptr(), kind.as_ptr(), value.as_ptr())
+            (m.set_property)(
+                data,
+                subject,
+                key.as_ptr(),
+                kind.map_or(std::ptr::null(), CStr::as_ptr),
+                value.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
+            )
         };
         result(res)
+    }
+
+    /// Asks WirePlumber to link the stream `id` to the device `device`, as pipewire-pulse does
+    /// for `move-sink-input`: `target.object` names the device by its serial.
+    fn move_stream(&mut self, id: u32, device: u32) -> Result<(), ServiceError> {
+        self.node(id)?;
+        let target = self.node(device)?;
+        let serial = prop(target, "object.serial");
+        let (kind, value) = if serial.is_empty() {
+            (None, prop(target, "node.name"))
+        } else {
+            (Some(c"Spa:Id"), serial)
+        };
+        self.set_metadata(id, "target.node", None, None)?;
+        self.set_metadata(id, "target.object", kind, Some(value.as_str()))
+    }
+
+    /// The card a device node is on, and its device's index on the card.
+    fn card_of(&self, node: &Node) -> Option<(&Card, i32)> {
+        let card = prop(node, "device.id").parse().ok()?;
+        let device = prop(node, "card.profile.device").parse().ok()?;
+        Some((self.cards.get(&card)?, device))
+    }
+
+    fn set_port(&mut self, id: u32, index: u32) -> Result<(), ServiceError> {
+        let node = self.node(id)?;
+        let (card, device) = self.card_of(node).ok_or(ServiceError::Unsupported)?;
+        set_card_param(
+            card.proxy,
+            pod::PARAM_ROUTE,
+            &pod::build_route(index, device),
+        )
+    }
+
+    fn set_profile(&mut self, id: u32, index: u32) -> Result<(), ServiceError> {
+        let card = self
+            .cards
+            .get(&id)
+            .ok_or(ServiceError::Failed("no such card".into()))?;
+        set_card_param(card.proxy, pod::PARAM_PROFILE, &pod::build_profile(index))
+    }
+
+    /// The ports of a card's device going the way of `kind`, in the card's profile, and the one
+    /// in use.
+    fn ports(&self, node: &Node) -> (Vec<AudioPort>, Option<u32>) {
+        let Some((card, device)) = self.card_of(node) else {
+            return (Vec::new(), None);
+        };
+        let direction = if node.kind == Kind::Sink {
+            pod::DIRECTION_OUTPUT
+        } else {
+            0
+        };
+        let profile = card.profile.map(|p| p as i32);
+        let ports = card
+            .routes
+            .values()
+            .filter(|r| {
+                r.direction == direction
+                    && r.devices.contains(&device)
+                    && (r.profiles.is_empty() || profile.is_none_or(|p| r.profiles.contains(&p)))
+            })
+            .map(|r| AudioPort {
+                index: r.index,
+                name: r.name.clone(),
+                description: if r.description.is_empty() {
+                    r.name.clone()
+                } else {
+                    r.description.clone()
+                },
+                available: availability(r.available),
+                priority: r.priority,
+            })
+            .collect();
+        (ports, card.active.get(&device).copied())
     }
 
     /// Puts what is known into the signals.
@@ -435,17 +744,29 @@ impl State {
         let shared = self.shared();
         let mut nodes: Vec<&Node> = self.nodes.values().map(|n| &**n).collect();
         nodes.sort_by_key(|n| n.id);
-        let device = |n: &Node| AudioDevice {
-            id: n.id,
-            name: prop(n, "node.name"),
-            description: ["node.description", "node.nick", "node.name"]
-                .iter()
-                .map(|k| prop(n, k))
-                .find(|d| !d.is_empty())
-                .unwrap_or_default(),
-            volume: volume(n),
-            muted: n.muted,
-            channels: n.volumes.len() as u32,
+        let device = |n: &Node| {
+            let (ports, port) = self.ports(n);
+            AudioDevice {
+                id: n.id,
+                name: prop(n, "node.name"),
+                description: ["node.description", "node.nick", "node.name"]
+                    .iter()
+                    .map(|k| prop(n, k))
+                    .find(|d| !d.is_empty())
+                    .unwrap_or_default(),
+                volume: volume(n),
+                muted: n.muted,
+                channels: n.volumes.len() as u32,
+                volumes: n.volumes.iter().map(|&v| cubic(v)).collect(),
+                positions: if n.positions.len() == n.volumes.len() {
+                    n.positions.clone()
+                } else {
+                    positions_in(&prop(n, "audio.position"))
+                },
+                card: prop(n, "device.id").parse().ok(),
+                ports,
+                port,
+            }
         };
         let of = |kind| {
             nodes
@@ -484,6 +805,41 @@ impl State {
             })
             .collect();
         put(&shared.streams, streams);
+        let mut cards: Vec<&Card> = self.cards.values().map(|c| &**c).collect();
+        cards.sort_by_key(|c| c.id);
+        let cards = cards
+            .iter()
+            .map(|c| {
+                let prop = |k: &str| c.props.get(k).cloned().unwrap_or_default();
+                AudioCard {
+                    id: c.id,
+                    name: prop("device.name"),
+                    description: ["device.description", "device.nick", "device.name"]
+                        .iter()
+                        .map(|k| prop(k))
+                        .find(|d| !d.is_empty())
+                        .unwrap_or_default(),
+                    icon_name: prop("device.icon-name"),
+                    profiles: c
+                        .profiles
+                        .values()
+                        .map(|p| AudioProfile {
+                            index: p.index,
+                            name: p.name.clone(),
+                            description: if p.description.is_empty() {
+                                p.name.clone()
+                            } else {
+                                p.description.clone()
+                            },
+                            available: availability(p.available),
+                            priority: p.priority,
+                        })
+                        .collect(),
+                    profile: c.profile,
+                }
+            })
+            .collect();
+        put(&shared.cards, cards);
         put(&shared.default_sink, self.default_sink.clone());
         put(&shared.default_source, self.default_source.clone());
     }
@@ -493,11 +849,12 @@ fn prop(n: &Node, key: &str) -> String {
     n.props.get(key).cloned().unwrap_or_default()
 }
 
+/// The loudest channel's volume, as PulseAudio shows a device's.
 fn volume(n: &Node) -> f64 {
     if n.volumes.is_empty() {
         return 1.0;
     }
-    cubic(n.volumes.iter().sum::<f32>() / n.volumes.len() as f32)
+    cubic(n.volumes.iter().copied().fold(0.0, f32::max))
 }
 
 fn put<T: PartialEq + Send + 'static>(signal: &SharedSignal<T>, value: T) {
@@ -529,6 +886,40 @@ fn set_props(proxy: *mut Object, pod: &[u64]) -> Result<(), ServiceError> {
         (m.set_param)(data, pod::PARAM_PROPS, 0, pod.as_ptr().cast::<SpaPod>())
     };
     result(res)
+}
+
+/// Sets a param of a card, like its profile or a route.
+fn set_card_param(proxy: *mut Object, id: u32, pod: &[u64]) -> Result<(), ServiceError> {
+    // SAFETY: a live device proxy, used under PipeWire's lock; the pod outlives the call, which
+    // copies it.
+    let res = unsafe {
+        let (m, data) = methods::<DeviceMethods>(proxy);
+        (m.set_param)(data, id, 0, pod.as_ptr().cast::<SpaPod>())
+    };
+    result(res)
+}
+
+/// The params of a card this reads.
+const CARD_PARAMS: [u32; 4] = [
+    pod::PARAM_ENUM_PROFILE,
+    pod::PARAM_PROFILE,
+    pod::PARAM_ENUM_ROUTE,
+    pod::PARAM_ROUTE,
+];
+
+impl Card {
+    /// Asks for the params `ids` again; what comes back replaces what was known of them.
+    fn ask(&mut self, ids: &[u32]) {
+        for &id in ids {
+            self.seq = self.seq.wrapping_add(1);
+            self.asked.insert(id);
+            // SAFETY: a live device proxy, on PipeWire's thread.
+            unsafe {
+                let (m, data) = methods::<DeviceMethods>(self.proxy);
+                (m.enum_params)(data, self.seq, id, 0, u32::MAX, std::ptr::null());
+            }
+        }
+    }
 }
 
 unsafe extern "C" fn core_error(
@@ -596,6 +987,7 @@ unsafe extern "C" fn global(
             props,
             volumes: Vec::new(),
             muted: false,
+            positions: Vec::new(),
             state,
         });
         let node_ptr: *mut Node = &mut *node;
@@ -608,6 +1000,47 @@ unsafe extern "C" fn global(
             (m.subscribe_params)(data, ids.as_mut_ptr(), 1);
         }
         state.nodes.insert(id, node);
+        state.publish();
+    } else if kind == ffi::INTERFACE_DEVICE {
+        if props.get("media.class").map(String::as_str) != Some("Audio/Device") {
+            return;
+        }
+        // SAFETY: as for nodes.
+        let proxy = unsafe {
+            let (m, registry) = methods::<RegistryMethods>(state.registry);
+            (m.bind)(
+                registry,
+                id,
+                ffi::INTERFACE_DEVICE.as_ptr().cast(),
+                ffi::VERSION_DEVICE,
+                0,
+            )
+        };
+        if proxy.is_null() {
+            return;
+        }
+        let mut card = Box::new(Card {
+            id,
+            proxy,
+            hook: SpaHook::new(),
+            props,
+            profiles: BTreeMap::new(),
+            routes: BTreeMap::new(),
+            profile: None,
+            active: BTreeMap::new(),
+            param_flags: HashMap::new(),
+            asked: HashSet::new(),
+            seq: 0,
+            state,
+        });
+        let card_ptr: *mut Card = &mut *card;
+        // SAFETY: a device proxy just bound; the hook and the card are boxed and stay until the
+        // proxy is destroyed. Its first info tells of its params, which `card_info` asks for.
+        unsafe {
+            let (m, data) = methods::<DeviceMethods>(proxy);
+            (m.add_listener)(data, &mut *card.hook, &DEVICE_EVENTS, card_ptr.cast());
+        }
+        state.cards.insert(id, card);
         state.publish();
     } else if kind == ffi::INTERFACE_METADATA {
         if props.get("metadata.name").map(String::as_str) != Some("default")
@@ -644,6 +1077,12 @@ unsafe extern "C" fn global_remove(data: *mut c_void, id: u32) {
         unsafe {
             node.hook.remove();
             (state.lib.proxy_destroy)(node.proxy);
+        }
+    } else if let Some(mut card) = state.cards.remove(&id) {
+        // SAFETY: as for nodes.
+        unsafe {
+            card.hook.remove();
+            (state.lib.proxy_destroy)(card.proxy);
         }
     } else if state.links.remove(&id).is_none() {
         return;
@@ -697,8 +1136,88 @@ unsafe extern "C" fn node_param(
     if let Some(muted) = props.mute {
         node.muted = muted;
     }
+    if let Some(map) = props.channel_map.filter(|m| !m.is_empty()) {
+        node.positions = map
+            .into_iter()
+            .map(|p| pod::channel_name(p).to_owned())
+            .collect();
+    }
     // SAFETY: the state outlives its nodes.
     unsafe { &*node.state }.publish();
+}
+
+unsafe extern "C" fn card_info(data: *mut c_void, info: *const DeviceInfo) {
+    // SAFETY: `data` is a card of the state, on PipeWire's thread; `info` is PipeWire's for the
+    // length of the call, with `n_params` params.
+    let (card, info) = unsafe { (&mut *data.cast::<Card>(), &*info) };
+    if info.change_mask & ffi::DEVICE_CHANGE_MASK_PROPS != 0 {
+        // SAFETY: as above.
+        card.props.extend(unsafe { ffi::dict(info.props) });
+    }
+    if info.change_mask & ffi::DEVICE_CHANGE_MASK_PARAMS != 0 && !info.params.is_null() {
+        // SAFETY: as above.
+        let params = unsafe { std::slice::from_raw_parts(info.params, info.n_params as usize) };
+        let changed: Vec<u32> = params
+            .iter()
+            .filter(|p| CARD_PARAMS.contains(&p.id) && p.flags & ffi::PARAM_INFO_READ != 0)
+            .filter(|p| card.param_flags.insert(p.id, p.flags) != Some(p.flags))
+            .map(|p| p.id)
+            .collect();
+        card.ask(&changed);
+    }
+    // SAFETY: the state outlives its cards.
+    unsafe { &*card.state }.publish();
+}
+
+unsafe extern "C" fn card_param(
+    data: *mut c_void,
+    _seq: c_int,
+    id: u32,
+    _index: u32,
+    _next: u32,
+    param: *const SpaPod,
+) {
+    if param.is_null() || !CARD_PARAMS.contains(&id) {
+        return;
+    }
+    // SAFETY: `data` is a card of the state, on PipeWire's thread; the pod is its header and
+    // `size` bytes after it.
+    let (card, bytes) = unsafe {
+        let size = (*param).size as usize;
+        (
+            &mut *data.cast::<Card>(),
+            std::slice::from_raw_parts(param.cast::<u8>(), 8 + size),
+        )
+    };
+    // The first answer to a request replaces what was known of that param.
+    if card.asked.remove(&id) {
+        match id {
+            pod::PARAM_ENUM_PROFILE => card.profiles.clear(),
+            pod::PARAM_PROFILE => card.profile = None,
+            pod::PARAM_ENUM_ROUTE => card.routes.clear(),
+            _ => card.active.clear(),
+        }
+    }
+    match id {
+        pod::PARAM_ENUM_PROFILE => {
+            if let Some(p) = pod::parse_profile(bytes) {
+                card.profiles.insert(p.index, p);
+            }
+        }
+        pod::PARAM_PROFILE => card.profile = pod::parse_profile(bytes).map(|p| p.index),
+        pod::PARAM_ENUM_ROUTE => {
+            if let Some(r) = pod::parse_route(bytes) {
+                card.routes.insert(r.index, r);
+            }
+        }
+        _ => {
+            if let Some(r) = pod::parse_route(bytes) {
+                card.active.insert(r.device, r.index);
+            }
+        }
+    }
+    // SAFETY: the state outlives its cards.
+    unsafe { &*card.state }.publish();
 }
 
 unsafe extern "C" fn metadata_property(
@@ -763,13 +1282,30 @@ mod tests {
     #[ignore = "needs a running PipeWire"]
     fn real_pipewire_is_read() {
         let audio = audio();
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::thread::sleep(std::time::Duration::from_secs(2));
         assert!(audio.available());
         assert!(!audio.sinks().is_empty());
         println!("default sink: {:?}", audio.default_sink());
         for stream in audio.streams() {
             println!("{stream:?}");
         }
+        for card in audio.cards() {
+            println!("{card:?}");
+        }
+    }
+
+    #[test]
+    fn balance_goes_both_ways() {
+        let stereo = vec!["FL".to_owned(), "FR".to_owned()];
+        assert_eq!(balance_of(&[0.8, 0.8], &stereo), 0.0);
+        assert!((balance_of(&[0.8, 0.4], &stereo) + 0.5).abs() < 1e-9);
+        assert!((balance_of(&[0.4, 0.8], &stereo) - 0.5).abs() < 1e-9);
+        let set = with_balance(&[0.8, 0.8], &stereo, -0.5);
+        assert_eq!(set, vec![0.8, 0.4]);
+        assert!((balance_of(&set, &stereo) + 0.5).abs() < 1e-9);
+        // Mono has no sides.
+        assert_eq!(balance_of(&[0.5], &["MONO".to_owned()]), 0.0);
+        assert_eq!(positions_in("[ FL, FR ]"), stereo);
     }
 
     #[test]

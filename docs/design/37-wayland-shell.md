@@ -436,7 +436,18 @@ audio.default_sink() -> Option<Device>     // name, description, volume, muted
 audio.sinks(); audio.sources(); audio.streams()  // streams はアプリごとの音
 dev.set_volume(0.5) -> Task<..>; dev.set_muted(true); audio.set_default(&dev)
 stream.set_volume(0.5); stream.set_muted(true)
+stream.move_to(&dev)                       // 別の機器で鳴らす（録音なら別の機器から録る）
+dev.volumes; dev.positions                 // チャンネルごとの音量と位置（FL、FR など）
+dev.balance(); dev.set_balance(-0.5)       // 左右のバランス。-1 が左だけ、1 が右だけ
+dev.ports; dev.port; dev.set_port(i)       // ヘッドホン、スピーカー、HDMI などのポート
+audio.cards()                              // サウンドカード：profiles、profile
+card.set_profile(i)                        // 「アナログステレオ」「HDMI」「オフ」など
 ```
+
+- **音量とバランス：** `volume` はいちばん大きいチャンネルの音量。`set_volume` は各チャンネルの割合を保つので、バランスは変わらない。バランスは PulseAudio と同じく、小さい側が大きい側の何割かで決める。
+- **機器の移動：** `move_to` は pipewire-pulse の `move-sink-input` と同じく、`default` メタデータのストリームの `target.object` に機器の `object.serial` を書く。リンクし直すのは WirePlumber で、選んだ機器はアプリごとに覚えられる。
+- **カード：** `media.class` が `Audio/Device` のデバイスをバインドし、`EnumProfile`、`Profile`、`EnumRoute`、`Route` を読む。デバイスの info で、パラメータのフラグが変わったものだけを `enum_params` で読み直し、最初の答えで前の値を置き換える。ポートは機器のノードの `device.id` と `card.profile.device` でカードのルートに結ぶ。選ぶときは `Profile` と `Route` のパラメータを `save` 付きで書く。
+- **音のレベル（ピーク）：** 読まない。機器ごとに録音のストリームを開いて、バッファを読む必要があるため。
 
 - **アプリごとの音（`AudioStream`）：** アプリ名、`media_name`、`icon_name`、実行ファイル名（`binary`）、用途（`role`、`media.role`。`Event` や `Notification` はシステムの音）、音量、ミュート、録音かどうか、つながる機器（`target`）を持つ。
 

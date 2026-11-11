@@ -176,6 +176,51 @@ pub struct NodeEvents {
     pub param: Option<unsafe extern "C" fn(*mut c_void, c_int, u32, u32, u32, *const SpaPod)>,
 }
 
+/// `pw_device_info`: a card.
+#[repr(C)]
+pub struct DeviceInfo {
+    pub id: u32,
+    pub change_mask: u64,
+    pub props: *const SpaDict,
+    pub params: *const ParamInfo,
+    pub n_params: u32,
+}
+
+/// `spa_param_info`: a param of an object, and flags that change when it does (the server
+/// flips `SPA_PARAM_INFO_SERIAL` each time).
+#[repr(C)]
+pub struct ParamInfo {
+    pub id: u32,
+    pub flags: u32,
+    pub user: u32,
+    pub seq: i32,
+    pub padding: [u32; 4],
+}
+
+/// `SPA_PARAM_INFO_READ`.
+pub const PARAM_INFO_READ: u32 = 1 << 1;
+
+pub const DEVICE_CHANGE_MASK_PROPS: u64 = 1 << 0;
+pub const DEVICE_CHANGE_MASK_PARAMS: u64 = 1 << 1;
+
+/// `pw_device_methods`, as far as `set_param`.
+#[repr(C)]
+pub struct DeviceMethods {
+    pub version: u32,
+    pub add_listener: AddListener<DeviceEvents>,
+    pub subscribe_params: unsafe extern "C" fn(*mut Object, *mut u32, u32) -> c_int,
+    pub enum_params:
+        unsafe extern "C" fn(*mut Object, c_int, u32, u32, u32, *const SpaPod) -> c_int,
+    pub set_param: unsafe extern "C" fn(*mut Object, u32, u32, *const SpaPod) -> c_int,
+}
+
+#[repr(C)]
+pub struct DeviceEvents {
+    pub version: u32,
+    pub info: Option<unsafe extern "C" fn(*mut c_void, *const DeviceInfo)>,
+    pub param: Option<unsafe extern "C" fn(*mut c_void, c_int, u32, u32, u32, *const SpaPod)>,
+}
+
 /// `pw_metadata_methods`, as far as `set_property`.
 #[repr(C)]
 pub struct MetadataMethods {
@@ -207,7 +252,9 @@ pub struct MetadataEvents {
 pub const VERSION_REGISTRY: u32 = 3;
 pub const VERSION_NODE: u32 = 3;
 pub const VERSION_METADATA: u32 = 3;
+pub const VERSION_DEVICE: u32 = 3;
 pub const INTERFACE_NODE: &[u8] = b"PipeWire:Interface:Node\0";
+pub const INTERFACE_DEVICE: &[u8] = b"PipeWire:Interface:Device\0";
 pub const INTERFACE_METADATA: &[u8] = b"PipeWire:Interface:Metadata\0";
 pub const INTERFACE_LINK: &[u8] = b"PipeWire:Interface:Link\0";
 

@@ -75,7 +75,9 @@ mod workspaces;
 #[cfg(feature = "apps")]
 pub use apps::{AppAction, Application, Apps, apps, icon_path};
 #[cfg(feature = "audio")]
-pub use audio::{Audio, AudioDevice, AudioStream, audio};
+pub use audio::{
+    Audio, AudioCard, AudioDevice, AudioPort, AudioProfile, AudioStream, audio,
+};
 #[cfg(feature = "battery")]
 pub use battery::{Battery, BatteryDevice, BatteryKind, BatteryState, battery};
 #[cfg(feature = "bluetooth")]
