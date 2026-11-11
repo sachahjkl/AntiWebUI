@@ -87,7 +87,11 @@ pub use lock::{LockState, SessionLock, lock_session, lock_state, spawn_lock_sess
 #[cfg(feature = "media")]
 pub use media::{Media, PlaybackStatus, Player, media};
 #[cfg(feature = "network")]
-pub use network::{AccessPoint, Connectivity, NetError, Network, Security, Wired, network};
+pub use network::{
+    AccessPoint, ActivationState, ConnectionKind, ConnectionSettings, Connectivity, DeviceKind,
+    DeviceState, IpConfig, IpMethod, IpSettings, NetError, Network, NetworkDevice, SavedConnection,
+    Security, Wired, network,
+};
 #[cfg(feature = "notifications")]
 pub use notifications::{Notification, NotificationServer, Urgency, notification_server};
 #[cfg(feature = "power-profiles")]
