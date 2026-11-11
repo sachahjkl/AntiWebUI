@@ -425,7 +425,10 @@ let audio = audio();
 audio.default_sink() -> Option<Device>     // name, description, volume, muted
 audio.sinks(); audio.sources(); audio.streams()  // streams はアプリごとの音
 dev.set_volume(0.5) -> Task<..>; dev.set_muted(true); audio.set_default(&dev)
+stream.set_volume(0.5); stream.set_muted(true)
 ```
+
+- **アプリごとの音（`AudioStream`）：** アプリ名、`media_name`、`icon_name`、実行ファイル名（`binary`）、用途（`role`、`media.role`。`Event` や `Notification` はシステムの音）、音量、ミュート、録音かどうか、つながる機器（`target`）を持つ。
 
 - **PipeWire の読み込み方：**
   - PipeWire をそのまま使う。libpipewire は動画の FFmpeg（[24](24-video.md)）と同じく、実行時に dlopen で読み込む。ビルドに C のライブラリは要らない。

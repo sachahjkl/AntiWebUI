@@ -44,6 +44,12 @@ pub struct AudioStream {
     pub media_name: String,
     /// The name of an icon in the icon theme, when the program says.
     pub icon_name: String,
+    /// The file name of the program's executable, like `firefox`, when PipeWire knows it: what
+    /// finds the program's `.desktop` file when it gives no icon.
+    pub binary: String,
+    /// What the sound is for, like `Music`, or `Notification` and `Event` for a system sound,
+    /// when the program says.
+    pub role: String,
     /// As [`AudioDevice::volume`].
     pub volume: f64,
     pub muted: bool,
@@ -464,6 +470,8 @@ impl State {
                         .unwrap_or_default(),
                     media_name: prop(n, "media.name"),
                     icon_name: prop(n, "application.icon-name"),
+                    binary: prop(n, "application.process.binary"),
+                    role: prop(n, "media.role"),
                     volume: volume(n),
                     muted: n.muted,
                     input,
@@ -747,6 +755,21 @@ mod tests {
         assert_eq!(name_in("{}"), None);
         let written = format!("{{\"name\":{}}}", json_string("x\"y\\z"));
         assert_eq!(name_in(&written).as_deref(), Some("x\"y\\z"));
+    }
+
+    /// Reads the PipeWire of the machine: `cargo test -p anti-webui-wayland-shell --features
+    /// audio -- --ignored --nocapture real_pipewire`.
+    #[test]
+    #[ignore = "needs a running PipeWire"]
+    fn real_pipewire_is_read() {
+        let audio = audio();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        assert!(audio.available());
+        assert!(!audio.sinks().is_empty());
+        println!("default sink: {:?}", audio.default_sink());
+        for stream in audio.streams() {
+            println!("{stream:?}");
+        }
     }
 
     #[test]
