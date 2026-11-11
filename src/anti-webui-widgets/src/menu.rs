@@ -91,6 +91,7 @@ pub struct MenuOptions {
     at: Option<Signal<Option<RectI>>>,
     match_anchor_width: bool,
     modal: bool,
+    kind: PopupKind,
 }
 
 impl Default for MenuOptions {
@@ -102,6 +103,7 @@ impl Default for MenuOptions {
             at: None,
             match_anchor_width: false,
             modal: true,
+            kind: PopupKind::Menu,
         }
     }
 }
@@ -145,6 +147,15 @@ impl MenuOptions {
     /// pointer, and a press outside of it closes it before it reaches anything.
     pub fn not_modal(mut self) -> Self {
         self.modal = false;
+        self
+    }
+
+    /// The kind of popup the menu and its submenus are. `PopupKind::Menu` by default: the menu
+    /// takes the pointer, as a menu does. `PopupKind::Bubble` draws it inside the window, without
+    /// a grab: for a window that takes the presses around it itself, such as a full-screen layer
+    /// opened for the menu, which never had a press of its own to grab with.
+    pub fn kind(mut self, kind: PopupKind) -> Self {
+        self.kind = kind;
         self
     }
 }
@@ -199,6 +210,8 @@ pub struct MenuState {
     refs: Signal<Vec<NodeRef>>,
     timer: Signal<Option<Timeout>>,
     is_sub: bool,
+    /// The kind of popup of this menu, and of its submenus (`MenuOptions::kind`).
+    kind: PopupKind,
 }
 
 impl MenuState {
@@ -215,6 +228,7 @@ impl MenuState {
             refs: signal(Vec::new()),
             timer: signal(None),
             is_sub,
+            kind: PopupKind::Menu,
         }
     }
 
@@ -304,10 +318,15 @@ impl MenuState {
             parent.close_all.get_untracked(),
             true,
         );
+        let child = MenuState {
+            kind: parent.kind,
+            ..child
+        };
         let options = MenuOptions::new()
             .placement(Placement::RightStart)
             .anchor(anchor)
-            .gap(2);
+            .gap(2)
+            .kind(parent.kind);
         el.node_ref(anchor)
             .access(move |a| a.role(Role::MenuItem).expanded(parent.is_open(i)))
             .on_hover(move |inside| parent.hover(i, inside))
@@ -478,6 +497,7 @@ where
             let mut surface = popup()
                 .placement(options.placement)
                 .gap(options.gap)
+                .kind(options.kind)
                 .on_dismiss(move || {
                     gone.set(true);
                     state.close();
@@ -530,6 +550,10 @@ where
 {
     let dismiss: Rc<dyn Fn()> = Rc::new(on_dismiss);
     let state = MenuState::new(memo(open), dismiss.clone(), dismiss, false);
+    let state = MenuState {
+        kind: options.kind,
+        ..state
+    };
     build(state, options, setup)
 }
 
