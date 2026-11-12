@@ -69,7 +69,7 @@ fn commands_print_end_take_input_and_are_killed() {
 
         // What can't be run.
         let p = Process::new("/nonexistent/anti-webui").spawn();
-        assert!(!p.running());
+        until("the failed start", || !p.running());
         assert_eq!(p.exit_status(), None);
         assert_eq!(p.error_lines().len(), 1);
 

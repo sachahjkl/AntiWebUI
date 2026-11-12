@@ -16,10 +16,10 @@ use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// How long `kill` waits after asking before it stops the process for good.
@@ -80,9 +80,10 @@ impl Process {
         self
     }
 
-    /// Starts it, on this UI thread: what it prints comes here. It is killed when the owner this is
-    /// called under goes. When it can't be started, the handle says so with an exit status of
-    /// `None` and a line of the error in [`RunningProcess::error_lines`].
+    /// Starts it: what it prints comes to this UI thread. The program is started, waited for and
+    /// read on threads of their own; this thread makes no system call for it. It is killed when
+    /// the owner this is called under goes. When it can't be started, the handle says so with an
+    /// exit status of `None` and a line of the error in [`RunningProcess::error_lines`].
     pub fn spawn(self) -> RunningProcess {
         let p = RunningProcess {
             lines: signal(Vec::new()),
@@ -120,53 +121,77 @@ impl Process {
             }
         });
 
-        let mut command = Command::new(&self.program);
-        command
-            .args(&self.args)
-            .envs(self.env.iter().map(|(k, v)| (k, v)))
-            .stdin(if self.stdin {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // Its own group, so that killing it takes what it started too.
-            .process_group(0);
-        if let Some(dir) = &self.dir {
-            command.current_dir(dir);
-        }
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(e) => {
-                push(p.errors, format!("can't run {:?}: {e}", self.program));
-                p.running.set(false);
-                return p;
-            }
-        };
+        let launch = Arc::new(Mutex::new(Launch::default()));
         let exited = Arc::new(AtomicBool::new(false));
-        let pid = child.id() as i32;
-        p.inner.with_untracked(|i| {
-            *i.pid.borrow_mut() = Some((pid, exited.clone()));
-            *i.stdin.borrow_mut() = child.stdin.take();
+        // What is written before it has started waits in the channel.
+        let input = self.stdin.then(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+            p.inner.with_untracked(|i| *i.stdin.borrow_mut() = Some(tx));
+            rx
         });
-        let readers = [
-            child
-                .stdout
-                .take()
-                .map(|o| read_lines(o, sender.clone(), Msg::Out)),
-            child
-                .stderr
-                .take()
-                .map(|e| read_lines(e, sender.clone(), Msg::Err)),
-        ];
-        let waited = exited.clone();
+        p.inner.with_untracked(|i| {
+            *i.launch.borrow_mut() = Some((launch.clone(), exited.clone()));
+        });
+        let (started, waited) = (launch.clone(), exited.clone());
         let _ = std::thread::Builder::new()
             .name("anti-webui process".into())
             .spawn(move || {
+                let mut command = Command::new(&self.program);
+                command
+                    .args(&self.args)
+                    .envs(self.env.iter().map(|(k, v)| (k, v)))
+                    .stdin(if input.is_some() {
+                        Stdio::piped()
+                    } else {
+                        Stdio::null()
+                    })
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    // Its own group, so that killing it takes what it started too.
+                    .process_group(0);
+                if let Some(dir) = &self.dir {
+                    command.current_dir(dir);
+                }
+                let mut child = match command.spawn() {
+                    Ok(child) => child,
+                    Err(e) => {
+                        sender.send(Msg::Err(format!("can't run {:?}: {e}", self.program)));
+                        sender.send(Msg::Exit(None));
+                        return;
+                    }
+                };
+                let pid = child.id() as i32;
+                let cancelled = {
+                    let mut launch = started.lock().unwrap_or_else(|e| e.into_inner());
+                    launch.pid = Some(pid);
+                    launch.cancelled
+                };
+                if cancelled {
+                    terminate(pid, waited.clone());
+                }
+                if let (Some(rx), Some(mut pipe)) = (input, child.stdin.take()) {
+                    let _ = std::thread::Builder::new()
+                        .name("anti-webui process input".into())
+                        .spawn(move || {
+                            for text in rx {
+                                if pipe.write_all(&text).and_then(|()| pipe.flush()).is_err() {
+                                    return;
+                                }
+                            }
+                        });
+                }
+                let readers = [
+                    child
+                        .stdout
+                        .take()
+                        .map(|o| read_lines(o, sender.clone(), Msg::Out)),
+                    child
+                        .stderr
+                        .take()
+                        .map(|e| read_lines(e, sender.clone(), Msg::Err)),
+                ];
                 let code = wait(&mut child);
-                let exited = waited;
-                exited.store(true, Ordering::Release);
+                waited.store(true, Ordering::Release);
                 // What it printed comes before it is said to have ended.
                 for reader in readers.into_iter().flatten() {
                     let _ = reader.join();
@@ -174,9 +199,29 @@ impl Process {
                 sender.send(Msg::Exit(code));
             });
         // Not through `p`: its signals may be gone by then.
-        on_cleanup(move || terminate(pid, exited));
+        on_cleanup(move || stop(&launch, exited));
         p
     }
+}
+
+/// Stops a process that was asked to start: at once when it has, else as soon as it does.
+fn stop(launch: &Mutex<Launch>, exited: Arc<AtomicBool>) {
+    let mut launch = launch.lock().unwrap_or_else(|e| e.into_inner());
+    match launch.pid {
+        Some(pid) => terminate(pid, exited),
+        None => launch.cancelled = true,
+    }
+}
+
+/// A process's start, and whether it has been waited for.
+type Started = (Arc<Mutex<Launch>>, Arc<AtomicBool>);
+
+/// Where the start of a process is: its id once it has started, and whether it was stopped
+/// before that.
+#[derive(Default)]
+struct Launch {
+    pid: Option<i32>,
+    cancelled: bool,
 }
 
 /// The exit code, or minus the signal that ended it.
@@ -221,9 +266,10 @@ type ExitListener = Rc<dyn Fn(Option<i32>)>;
 
 #[derive(Default)]
 struct Inner {
-    /// Its process id, and whether it has been waited for, after which the id may be another's.
-    pid: RefCell<Option<(i32, Arc<AtomicBool>)>>,
-    stdin: RefCell<Option<ChildStdin>>,
+    /// Its start, and whether it has been waited for, after which its id may be another's.
+    launch: RefCell<Option<Started>>,
+    /// Its input, written on a thread of its own.
+    stdin: RefCell<Option<std::sync::mpsc::Sender<Vec<u8>>>>,
     on_line: RefCell<Vec<LineListener>>,
     on_exit: RefCell<Vec<ExitListener>>,
 }
@@ -289,13 +335,10 @@ impl RunningProcess {
     pub fn write(&self, text: &str) -> bool {
         self.inner.with_untracked(|i| {
             let mut stdin = i.stdin.borrow_mut();
-            let Some(pipe) = stdin.as_mut() else {
+            let Some(input) = stdin.as_ref() else {
                 return false;
             };
-            let ok = pipe
-                .write_all(text.as_bytes())
-                .and_then(|()| pipe.flush())
-                .is_ok();
+            let ok = input.send(text.as_bytes().to_vec()).is_ok();
             if !ok {
                 *stdin = None;
             }
@@ -314,8 +357,8 @@ impl RunningProcess {
         if !self.inner.is_alive() {
             return;
         }
-        if let Some((pid, exited)) = self.inner.with_untracked(|i| i.pid.borrow().clone()) {
-            terminate(pid, exited);
+        if let Some((launch, exited)) = self.inner.with_untracked(|i| i.launch.borrow().clone()) {
+            stop(&launch, exited);
         }
     }
 }
@@ -325,11 +368,11 @@ fn terminate(pid: i32, exited: Arc<AtomicBool>) {
     if exited.load(Ordering::Acquire) {
         return;
     }
-    // SAFETY: a plain call; the group is the process's own, which hasn't been waited for.
-    unsafe { libc::kill(-pid, libc::SIGTERM) };
     let _ = std::thread::Builder::new()
         .name("anti-webui kill".into())
         .spawn(move || {
+            // SAFETY: a plain call; the group is the process's own, which hasn't been waited for.
+            unsafe { libc::kill(-pid, libc::SIGTERM) };
             let end = std::time::Instant::now() + GRACE;
             while std::time::Instant::now() < end {
                 if exited.load(Ordering::Acquire) {
