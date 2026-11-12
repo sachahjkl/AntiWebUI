@@ -725,8 +725,11 @@ platform_for!(windows, Windows);
 /// The loop of a thread with windows: it ends when they are all closed, or with the first window
 /// of the program.
 struct Thread<P: Platform> {
-    session: P,
+    // Fields drop in this order: the windows first. Their GPU surfaces free their buffers through
+    // the session's connection (Vulkan's Wayland swapchain destroys its wl_buffers), so the
+    // connection must still be there; dropped after it, they crashed in libwayland.
     windows: Windows<P::Key>,
+    session: P,
     /// The program's first window, which ends it.
     first: Option<P::Key>,
     app_id: String,
