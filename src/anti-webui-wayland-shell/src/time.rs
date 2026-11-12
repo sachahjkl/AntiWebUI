@@ -2,7 +2,7 @@
 //! every frame.
 
 use anti_webui_core::animation::set_timeout;
-use anti_webui_core::reactive::{Signal, create_root, signal};
+use anti_webui_core::reactive::{Owner, Signal, create_root, signal};
 use anti_webui_core::window::current_window;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -112,9 +112,15 @@ pub fn local_time(every: Every) -> LocalTime {
     let window = current_window().id().get();
     let found = CLOCKS.with(|c| c.borrow().get(&(window, every)).copied());
     let clock = found.unwrap_or_else(|| {
-        let (clock, _) = create_root(|| signal(LocalTime::now()));
+        // Its timer belongs to its own root: under the view that first reads it, the timer would
+        // be cancelled when that view runs again (`set_timeout` goes with the owner it is set
+        // in), and the clock, kept for the window, would stop for good.
+        let (clock, _) = create_root(|| {
+            let clock = signal(LocalTime::now());
+            tick(clock, every);
+            clock
+        });
         CLOCKS.with(|c| c.borrow_mut().insert((window, every), clock));
-        tick(clock, every);
         clock
     });
     clock.get()
@@ -130,10 +136,15 @@ fn tick(clock: Signal<LocalTime>, every: Every) {
         Duration::from_secs(now.as_secs() % step) + Duration::from_nanos(now.subsec_nanos() as u64);
     // A little after the turn, so that the time read is past it.
     let wait = Duration::from_secs(step).saturating_sub(into) + Duration::from_millis(5);
+    let owner = Owner::current();
     set_timeout(wait, move || {
         if clock.is_alive() {
             clock.set(LocalTime::now());
-            tick(clock, every);
+            // The next one in the clock's root too, whatever owner runs the timers.
+            match owner {
+                Some(owner) if owner.is_alive() => owner.with(|| tick(clock, every)),
+                _ => tick(clock, every),
+            }
         }
     });
 }
