@@ -45,12 +45,16 @@ pub enum GpuError {
     IoSurface(String),
     /// The platform can't make a GPU surface here, like on a thread other than AppKit's.
     NoSurface,
+    /// The adapter offers no format for this surface (yet): nothing can be shown on it. The
+    /// next frame tries again.
+    NoFormat,
 }
 
 impl std::fmt::Display for GpuError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             GpuError::Surface(e) => write!(f, "failed to create surface: {e}"),
+            GpuError::NoFormat => write!(f, "the adapter offers no format for this surface"),
             GpuError::Adapter(e) => write!(f, "no suitable GPU adapter: {e}"),
             GpuError::Device(e) => write!(f, "failed to create GPU device: {e}"),
             GpuError::Dmabuf(e) => write!(f, "dmabuf presentation unavailable: {e}"),
@@ -202,7 +206,7 @@ impl Gpu {
             device,
             queue,
         };
-        let window = gpu.configure_window(surface, width, height);
+        let window = gpu.configure_window(surface, width, height)?;
         Ok((gpu, window))
     }
 
@@ -226,7 +230,7 @@ impl Gpu {
                 })
         }
         .map_err(GpuError::Surface)?;
-        Ok(self.configure_window(surface, width, height))
+        self.configure_window(surface, width, height)
     }
 
     /// Creates a GPU context without a window, for offscreen rendering.
@@ -261,8 +265,14 @@ impl Gpu {
         surface: wgpu::Surface<'static>,
         width: u32,
         height: u32,
-    ) -> WindowRenderer {
+    ) -> Result<WindowRenderer, GpuError> {
         let caps = surface.get_capabilities(&self.adapter);
+        // None: the adapter cannot present on this surface, at least not yet (seen with a
+        // software adapter on a surface just made). Configuring it would fail; the caller tries
+        // again at the next frame.
+        let Some(&first) = caps.formats.first() else {
+            return Err(GpuError::NoFormat);
+        };
         // Non-sRGB formats blend in gamma space, like browsers do.
         let format = caps
             .formats
@@ -274,7 +284,7 @@ impl Gpu {
                     wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm
                 )
             })
-            .unwrap_or(caps.formats[0]);
+            .unwrap_or(first);
         let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
             wgpu::PresentMode::Mailbox
         } else {
@@ -291,7 +301,8 @@ impl Gpu {
         ]
         .into_iter()
         .find(|m| caps.alpha_modes.contains(m))
-        .unwrap_or(caps.alpha_modes[0]);
+        .or_else(|| caps.alpha_modes.first().copied())
+        .unwrap_or(wgpu::CompositeAlphaMode::Auto);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
@@ -318,13 +329,13 @@ impl Gpu {
             (config, copies.then_some(None))
         };
         surface.configure(&self.device, &config);
-        WindowRenderer {
+        Ok(WindowRenderer {
             surface,
             config,
             renderer: Renderer::new(&self.device, format),
             #[cfg(windows)]
             retained,
-        }
+        })
     }
 
     /// Renders a scene offscreen and returns tightly packed RGBA8 pixels.
