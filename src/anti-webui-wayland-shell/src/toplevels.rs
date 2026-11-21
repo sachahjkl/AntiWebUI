@@ -153,6 +153,10 @@ impl Toplevels {
 pub(crate) struct Shared {
     list: SharedSignal<Vec<Toplevel>>,
     control: bool,
+    /// An ext list bound beside a wlr manager: its windows only pair with the wlr ones. Known
+    /// from the bind, not from the first wlr window: on an empty desktop the compositor may tell
+    /// of a new window's ext handle first, which must not become a window of its own.
+    pairs: bool,
 }
 
 static SHARED: OnceLock<Option<Arc<Shared>>> = OnceLock::new();
@@ -166,6 +170,7 @@ fn shared() -> Option<&'static Shared> {
             let wlr = Arc::new(Shared {
                 list: list.clone(),
                 control: true,
+                pairs: false,
             });
             if link
                 .bind::<wlr_manager::ZwlrForeignToplevelManagerV1, _>(3, wlr.clone())
@@ -177,6 +182,7 @@ fn shared() -> Option<&'static Shared> {
                     Arc::new(Shared {
                         list: shared_signal(Vec::new()),
                         control: false,
+                        pairs: true,
                     }),
                 );
                 link.sync();
@@ -185,6 +191,7 @@ fn shared() -> Option<&'static Shared> {
             let ext = Arc::new(Shared {
                 list,
                 control: false,
+                pairs: false,
             });
             link.bind::<ext_list::ExtForeignToplevelListV1, _>(1, ext.clone())?;
             link.sync();
@@ -391,20 +398,24 @@ impl Dispatch<ext_list::ExtForeignToplevelListV1, Arc<Shared>> for Conn {
         conn: &mut Self,
         _: &ext_list::ExtForeignToplevelListV1,
         event: ext_list::Event,
-        _: &Arc<Shared>,
+        shared: &Arc<Shared>,
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
         if let ext_list::Event::Toplevel { toplevel } = event {
-            match &mut conn.toplevels.shadows {
-                Some(shadows) => shadows.push(Shadow {
-                    handle: toplevel,
-                    title: String::new(),
-                    app_id: String::new(),
-                    identifier: None,
-                    done: false,
-                }),
-                None => conn.toplevels.add(Target::Ext(toplevel)),
+            if shared.pairs {
+                conn.toplevels
+                    .shadows
+                    .get_or_insert_with(Vec::new)
+                    .push(Shadow {
+                        handle: toplevel,
+                        title: String::new(),
+                        app_id: String::new(),
+                        identifier: None,
+                        done: false,
+                    });
+            } else {
+                conn.toplevels.add(Target::Ext(toplevel));
             }
         }
     }
