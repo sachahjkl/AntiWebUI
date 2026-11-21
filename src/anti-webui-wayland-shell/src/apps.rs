@@ -71,8 +71,14 @@ impl Application {
     /// Starts it, apart from this program: it goes on when this ends. It gets an activation token,
     /// so that the compositor lets it come to the front.
     pub fn launch(&self) -> Task<Result<(), ServiceError>> {
+        self.launch_in(Vec::new())
+    }
+
+    /// [`launch`](Self::launch), its command line after `prefix`: a program that runs the
+    /// application in its own place, such as `systemd-run --user --scope … --`.
+    pub fn launch_in(&self, prefix: Vec<String>) -> Task<Result<(), ServiceError>> {
         let (exec, context) = (self.exec.clone(), self.context.clone());
-        task(move || launch(&exec, &context))
+        task(move || launch(&exec, &context, &prefix))
     }
 }
 
@@ -82,8 +88,13 @@ impl AppAction {
     }
 
     pub fn launch(&self) -> Task<Result<(), ServiceError>> {
+        self.launch_in(Vec::new())
+    }
+
+    /// [`Application::launch_in`] for the action.
+    pub fn launch_in(&self, prefix: Vec<String>) -> Task<Result<(), ServiceError>> {
         let (exec, context) = (self.exec.clone(), self.context.clone());
-        task(move || launch(&exec, &context))
+        task(move || launch(&exec, &context, &prefix))
     }
 }
 
@@ -695,7 +706,7 @@ fn in_terminal(argv: Vec<String>) -> Option<Vec<String>> {
     )
 }
 
-fn launch(exec: &str, context: &Context) -> Result<(), ServiceError> {
+fn launch(exec: &str, context: &Context, prefix: &[String]) -> Result<(), ServiceError> {
     let failed = |why: String| ServiceError::Failed(why);
     let mut argv = expand(
         split_exec(exec).ok_or_else(|| failed(format!("can't read Exec={exec}")))?,
@@ -706,6 +717,9 @@ fn launch(exec: &str, context: &Context) -> Result<(), ServiceError> {
     }
     if context.terminal {
         argv = in_terminal(argv).ok_or_else(|| failed("no terminal to run it in".into()))?;
+    }
+    if !prefix.is_empty() {
+        argv = prefix.iter().cloned().chain(argv).collect();
     }
     let app_id = context.id.strip_suffix(".desktop").unwrap_or(&context.id);
     let token = activation_token(app_id);
