@@ -556,6 +556,11 @@ type DraggedValue = Option<Rc<dyn Any>>;
 
 thread_local! {
     static DRAGGED: Cell<Option<Signal<DraggedValue>>> = const { Cell::new(None) };
+    /// The drag a window of this thread has handed to the platform, while it runs: its value, its
+    /// type and its formats. Another window of the thread it enters takes it as the value it is,
+    /// not as another program's data: a shell's panel on a surface of its own drops on its bar.
+    static OUTGOING: std::cell::RefCell<Option<(Rc<dyn Any>, TypeId, Vec<String>)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn dragged_signal() -> Signal<DraggedValue> {
@@ -1018,6 +1023,9 @@ impl Ui {
         let value = data.value.clone();
         let mimes: Vec<String> = items.iter().map(|(m, _)| m.clone()).collect();
         let allowed = data.allowed();
+        if wants_platform {
+            OUTGOING.with(|o| *o.borrow_mut() = Some((value.clone(), data.type_id, mimes.clone())));
+        }
         self.drag = Some(DragSession {
             source,
             text_source,
@@ -1225,7 +1233,14 @@ impl Ui {
         if let Some(owner) = session.preview {
             owner.dispose();
         }
-        batch(|| dragged_signal().set(None));
+        // The window that started a platform drag ends it for the thread. Another window that only
+        // received it leaves the value to that one, which still drags it.
+        if session.mode == Mode::Platform {
+            OUTGOING.with(|o| o.borrow_mut().take());
+        }
+        if OUTGOING.with(|o| o.borrow().is_none()) {
+            batch(|| dragged_signal().set(None));
+        }
         if session.mode == Mode::Platform {
             with_doc(|d| d.request(PlatformRequest::CloseDragIcon));
         }
@@ -1391,14 +1406,31 @@ impl Ui {
                         session.told = None;
                     }
                     None => {
-                        let value = Rc::new(ExternalDrag {
-                            mimes: mimes.clone(),
+                        // A drag of another window of this thread, in the same formats: its own
+                        // value, so that a typed drop target here takes it. Else another program's.
+                        let own = OUTGOING.with(|o| {
+                            o.borrow()
+                                .as_ref()
+                                .filter(|(_, _, own_mimes)| {
+                                    own_mimes.len() == mimes.len()
+                                        && own_mimes.iter().all(|m| mimes.contains(m))
+                                })
+                                .map(|(value, type_id, _)| (value.clone(), *type_id))
                         });
+                        let (value, type_id): (Rc<dyn Any>, TypeId) = match own {
+                            Some(own) => own,
+                            None => (
+                                Rc::new(ExternalDrag {
+                                    mimes: mimes.clone(),
+                                }),
+                                TypeId::of::<ExternalDrag>(),
+                            ),
+                        };
                         self.drag = Some(DragSession {
                             source: None,
                             text_source: None,
                             value: value.clone(),
-                            type_id: TypeId::of::<ExternalDrag>(),
+                            type_id,
                             items: Vec::new(),
                             mimes,
                             allowed: DragActions::Both,

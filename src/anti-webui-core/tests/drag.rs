@@ -1212,6 +1212,50 @@ fn a_platform_drag_over_this_window_goes_to_what_takes_its_value() {
 }
 
 #[test]
+fn a_platform_drag_of_another_window_of_the_thread_keeps_its_value() {
+    // A panel on a surface of its own and the bar it drops on: two windows, one thread.
+    let (taken, result): (Rc<RefCell<Vec<String>>>, _) = Default::default();
+    let mut source = mount(|| offering(&taken, &result));
+    source.set_platform_drag(true);
+    let (got, unused): (Rc<RefCell<Vec<String>>>, Rc<Cell<Option<DragResult>>>) =
+        Default::default();
+    let mut target = mount(|| offering(&got, &unused));
+    target.set_platform_drag(true);
+
+    press(&mut source, 10.0, 10.0);
+    requests_of(&mut source);
+    moved(&mut source, 50.0, 10.0);
+    let requests = requests_of(&mut source);
+    let [PlatformRequest::StartDrag(DragOffer { items, .. })] = &requests[..] else {
+        panic!("{requests:?}");
+    };
+    let offered: Vec<&str> = items.iter().map(|(m, _)| m.as_str()).collect();
+    source.handle_event(WindowEvent::PointerLeft);
+    requests_of(&mut source);
+
+    // The platform brings it over the other window, in the formats it was given.
+    entered(&mut target, 250.0, 10.0, &offered);
+    assert_eq!(
+        requests_of(&mut target),
+        // Taken by its value: no format is read.
+        [PlatformRequest::AcceptDrag(Some((
+            "text/plain;charset=utf-8".into(),
+            DragAction::Move
+        )))]
+    );
+    target.handle_event(WindowEvent::DragDropped {
+        position: at(250.0, 10.0),
+        action: DragAction::Move,
+    });
+    assert_eq!(*got.borrow(), ["card 1"], "the drop target has the card itself");
+    assert_eq!(requests_of(&mut target), [PlatformRequest::FinishDrop]);
+
+    // The window that started it ends it when the platform says.
+    source.handle_event(WindowEvent::DragSourceEnded(DragResult::Moved));
+    assert_eq!(result.get(), Some(DragResult::Moved));
+}
+
+#[test]
 fn a_platform_drag_gives_its_own_text_without_reading() {
     let (taken, result): (Rc<RefCell<Vec<String>>>, _) = Default::default();
     let mut ui = mount(|| offering(&taken, &result));
