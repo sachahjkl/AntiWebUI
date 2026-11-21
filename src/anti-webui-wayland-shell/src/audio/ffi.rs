@@ -113,15 +113,31 @@ pub struct NodeInfo {
 
 pub const NODE_CHANGE_MASK_PROPS: u64 = 1 << 3;
 
+/// `pw_device_info`: a card.
 #[repr(C)]
 pub struct DeviceInfo {
     pub id: u32,
     pub change_mask: u64,
     pub props: *const SpaDict,
-    pub params: *const c_void,
+    pub params: *const ParamInfo,
     pub n_params: u32,
 }
 
+/// `spa_param_info`: a param of an object, and flags that change when it does (the server
+/// flips `SPA_PARAM_INFO_SERIAL` each time).
+#[repr(C)]
+pub struct ParamInfo {
+    pub id: u32,
+    pub flags: u32,
+    pub user: u32,
+    pub seq: i32,
+    pub padding: [u32; 4],
+}
+
+/// `SPA_PARAM_INFO_READ`.
+pub const PARAM_INFO_READ: u32 = 1 << 1;
+
+pub const DEVICE_CHANGE_MASK_PROPS: u64 = 1 << 0;
 pub const DEVICE_CHANGE_MASK_PARAMS: u64 = 1 << 1;
 /// The id of the core, as an object.
 pub const ID_CORE: u32 = 0;
