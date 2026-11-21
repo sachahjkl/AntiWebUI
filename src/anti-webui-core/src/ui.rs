@@ -913,6 +913,7 @@ impl Ui {
                     d.mark_paint();
                 });
                 if !focused {
+                    self.modifiers = Modifiers::default();
                     self.cancel_gesture_for_focus();
                     self.cancel_press();
                 }

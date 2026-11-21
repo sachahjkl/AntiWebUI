@@ -1129,6 +1129,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 state.keyboard_focused = true;
             }
             wl_keyboard::Event::Leave { .. } => {
+                state.kb.clear_modifiers();
                 if !std::mem::take(&mut state.keyboard_here) {
                     return;
                 }
@@ -1142,6 +1143,13 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 group,
                 ..
             } => {
+                // Wayland broadcasts `Modifiers` to every `wl_keyboard` of the focused client.
+                // A window without focus (such as a `Keyboard::None` layer surface) does not get
+                // its own `Leave` when the focused surface is destroyed, so taking modifiers
+                // while unfocused would leave them stuck on it.
+                if !state.keyboard_here {
+                    return;
+                }
                 state
                     .kb
                     .update_modifiers(mods_depressed, mods_latched, mods_locked, group);

@@ -61,6 +61,15 @@ impl Keyboard {
         };
     }
 
+    /// Resets held modifiers when keyboard focus leaves so a key released while unfocused
+    /// cannot stay stuck on subsequent pointer events.
+    pub fn clear_modifiers(&mut self) {
+        self.modifiers = Modifiers::default();
+        if let Some(state) = &mut self.state {
+            state.update_mask(0, 0, 0, 0, 0, 0);
+        }
+    }
+
     pub fn repeats(&self, keycode: u32) -> bool {
         self.state
             .as_ref()
@@ -122,4 +131,34 @@ fn map_keysym(sym: xkb::Keysym) -> Key {
         }
     };
     Key::Named(named)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clear_modifiers_resets_active_modifiers() {
+        let mut kb = Keyboard::new();
+        let keymap = xkb::Keymap::new_from_names(
+            &kb.context,
+            "",
+            "",
+            "us",
+            "",
+            None,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .expect("default us keymap");
+        let shift_bit = 1u32 << keymap.mod_get_index(xkb::MOD_NAME_SHIFT);
+        let ctrl_bit = 1u32 << keymap.mod_get_index(xkb::MOD_NAME_CTRL);
+        kb.state = Some(xkb::State::new(&keymap));
+
+        kb.update_modifiers(shift_bit | ctrl_bit, 0, 0, 0);
+        assert!(kb.modifiers.shift);
+        assert!(kb.modifiers.ctrl);
+
+        kb.clear_modifiers();
+        assert_eq!(kb.modifiers, Modifiers::default());
+    }
 }
