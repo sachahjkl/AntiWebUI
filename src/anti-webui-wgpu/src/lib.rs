@@ -67,12 +67,16 @@ pub enum GpuError {
     IoSurface(String),
     /// The platform can't make a GPU surface here, like on a thread other than AppKit's.
     NoSurface,
+    /// The adapter offers no format for this surface (yet): nothing can be shown on it. The
+    /// caller decides whether to try again later.
+    NoFormat,
 }
 
 impl std::fmt::Display for GpuError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             GpuError::Surface(e) => write!(f, "failed to create surface: {e}"),
+            GpuError::NoFormat => write!(f, "the adapter offers no format for this surface"),
             GpuError::Adapter(e) => write!(f, "no suitable GPU adapter: {e}"),
             GpuError::Device(e) => write!(f, "failed to create GPU device: {e}"),
             GpuError::Dmabuf(e) => write!(f, "dmabuf presentation unavailable: {e}"),
@@ -217,7 +221,7 @@ impl Gpu {
             if let Ok(surface) = surface
                 && gpu.adapter.is_surface_supported(&surface)
             {
-                let window = gpu.configure_window(surface, window, width, height);
+                let window = gpu.configure_window(surface, window, width, height)?;
                 return Ok((gpu, window));
             }
         }
@@ -262,7 +266,7 @@ impl Gpu {
             return Err(last_error.expect("at least one backend was tried"));
         };
         let gpu = Gpu::open(instance, adapter)?;
-        let window = gpu.configure_window(surface, window, width, height);
+        let window = gpu.configure_window(surface, window, width, height)?;
         Ok((gpu, window))
     }
 
@@ -318,7 +322,7 @@ impl Gpu {
                 })
         }
         .map_err(GpuError::Surface)?;
-        Ok(self.configure_window(surface, window, width, height))
+        self.configure_window(surface, window, width, height)
     }
 
     /// Creates a GPU context without a window, for offscreen rendering.
@@ -355,8 +359,14 @@ impl Gpu {
         window: RawWindowHandle,
         width: u32,
         height: u32,
-    ) -> WindowRenderer {
+    ) -> Result<WindowRenderer, GpuError> {
         let caps = surface.get_capabilities(&self.adapter);
+        // None: the adapter cannot present on this surface, at least not yet (seen with a
+        // software adapter on a surface just made). There is no format to configure it with;
+        // the caller gets an error instead of a panic on an empty list.
+        let Some(&first) = caps.formats.first() else {
+            return Err(GpuError::NoFormat);
+        };
         // Non-sRGB formats blend in gamma space, like browsers do.
         let format = caps
             .formats
@@ -368,7 +378,7 @@ impl Gpu {
                     wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm
                 )
             })
-            .unwrap_or(caps.formats[0]);
+            .unwrap_or(first);
         let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
             wgpu::PresentMode::Mailbox
         } else {
@@ -385,7 +395,8 @@ impl Gpu {
         ]
         .into_iter()
         .find(|m| caps.alpha_modes.contains(m))
-        .unwrap_or(caps.alpha_modes[0]);
+        .or_else(|| caps.alpha_modes.first().copied())
+        .unwrap_or(wgpu::CompositeAlphaMode::Auto);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
@@ -420,7 +431,7 @@ impl Gpu {
             let _ = window;
             surface.configure(&self.device, &config);
         }
-        WindowRenderer {
+        Ok(WindowRenderer {
             surface,
             config,
             renderer: Renderer::with_cache(&self.device, format, self.shader_cache.clone()),
@@ -428,7 +439,7 @@ impl Gpu {
             retained,
             #[cfg(windows)]
             dxgi,
-        }
+        })
     }
 
     /// Our own swapchain for the window, if wgpu draws with DX12 and it can be made: it tells DWM
